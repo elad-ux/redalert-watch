@@ -1,1 +1,608 @@
+package com.redalert.watch
 
+import android.app.*
+import android.content.*
+import android.location.*
+import android.os.*
+import android.util.Log
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.shape.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.*
+import androidx.compose.ui.draw.*
+import androidx.compose.ui.graphics.*
+import androidx.compose.ui.text.font.*
+import androidx.compose.ui.text.style.*
+import androidx.compose.ui.unit.*
+import androidx.core.app.NotificationCompat
+import androidx.lifecycle.*
+import androidx.wear.compose.material.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import org.json.JSONObject
+import java.net.URL
+import javax.net.ssl.HttpsURLConnection
+
+// ─────────────────────────────────────────────────────────────────────────────
+// APP STATE
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum class Screen { STANDBY, ALERT, SETTINGS }
+
+data class AlertState(
+    val active: Boolean     = false,
+    val cities: List<String> = emptyList(),
+    val type: String        = "missiles",
+    val instructions: String = "",
+    val countdown: Int      = 0,
+    val triggeredAt: Long   = 0L
+)
+
+data class AppPrefs(
+    val watchedAreas: Set<String>  = emptySet(),
+    val useGps: Boolean            = false,
+    val gpsCity: String?           = null
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN ACTIVITY
+// ─────────────────────────────────────────────────────────────────────────────
+
+class MainActivity : ComponentActivity() {
+
+    private val prefs   by lazy { AppPreferences(this) }
+    private val polling by lazy { OrefPoller(this, prefs) }
+
+    private val locationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        if (granted.values.any { it }) startGpsLookup()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        createNotificationChannel()
+
+        setContent {
+            val alert by polling.alertState.collectAsState()
+            val appPrefs by prefs.state.collectAsState()
+            var screen by remember { mutableStateOf(Screen.STANDBY) }
+
+            // auto-navigate to alert screen
+            LaunchedEffect(alert.active) {
+                if (alert.active) screen = Screen.ALERT
+            }
+
+            MaterialTheme {
+                when (screen) {
+                    Screen.STANDBY  -> StandbyScreen(
+                        alert    = alert,
+                        prefs    = appPrefs,
+                        onSettings = { screen = Screen.SETTINGS }
+                    )
+                    Screen.ALERT    -> AlertScreen(
+                        alert  = alert,
+                        onDismiss = { screen = Screen.STANDBY }
+                    )
+                    Screen.SETTINGS -> SettingsScreen(
+                        prefs  = appPrefs,
+                        onRequestGps = { requestGpsPermission() },
+                        onSave = { updated ->
+                            prefs.save(updated)
+                            screen = Screen.STANDBY
+                        }
+                    )
+                }
+            }
+        }
+
+        polling.start()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        polling.stop()
+    }
+
+    private fun requestGpsPermission() {
+        locationPermission.launch(arrayOf(
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION
+        ))
+    }
+
+    private fun startGpsLookup() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+                val loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                    ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                    ?: return@launch
+                val geocoder = Geocoder(this@MainActivity)
+                val addresses = geocoder.getFromLocation(loc.latitude, loc.longitude, 1)
+                val city = addresses?.firstOrNull()?.locality
+                    ?: addresses?.firstOrNull()?.subAdminArea
+                if (city != null) {
+                    val current = prefs.state.value
+                    prefs.save(current.copy(gpsCity = city, useGps = true))
+                }
+            } catch (e: Exception) {
+                Log.w("GPS", "Location lookup failed", e)
+            }
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(
+                ALERT_CHANNEL, "צבע אדום", NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                enableVibration(true)
+                vibrationPattern = longArrayOf(0, 600, 150, 600, 150, 600)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+        }
+    }
+
+    companion object {
+        const val ALERT_CHANNEL = "redalert_watch"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OREF POLLER  (polls oref.org.il every 2s)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class OrefPoller(
+    private val ctx: Context,
+    private val prefs: AppPreferences
+) {
+
+    val alertState = MutableStateFlow(AlertState())
+    private var job: Job? = null
+    private var lastAlertId = ""
+
+    fun start() {
+        job = CoroutineScope(Dispatchers.IO).launch {
+            while (isActive) {
+                try { poll() } catch (e: Exception) { Log.w("OrefPoller", e.message) }
+                delay(2_000)
+            }
+        }
+    }
+
+    fun stop() { job?.cancel() }
+
+    private suspend fun poll() {
+        val conn = URL(ALERT_URL).openConnection() as HttpsURLConnection
+        conn.requestMethod = "GET"
+        conn.connectTimeout = 4_000
+        conn.readTimeout    = 4_000
+        conn.setRequestProperty("Referer",          "https://www.oref.org.il/")
+        conn.setRequestProperty("X-Requested-With", "XMLHttpRequest")
+
+        val body: String
+        try {
+            body = conn.inputStream.readBytes().toString(Charsets.UTF_8).trim()
+                .trimStart('\uFEFF') // הסר BOM אם קיים
+        } finally {
+            conn.disconnect()
+        }
+
+        if (body.isBlank() || body == "null") {
+            // No active alert
+            if (alertState.value.active) alertState.emit(AlertState())
+            return
+        }
+
+        val json    = JSONObject(body)
+        val id      = json.optString("id", "")
+        val dataArr = json.optJSONArray("data") ?: return
+        val cities  = (0 until dataArr.length()).map { dataArr.getString(it) }
+        val type    = json.optString("title", "missiles")
+        val instr   = json.optString("desc",  "היכנסו למרחב המוגן")
+        val cat     = json.optInt("cat", 1)
+        val countdown = countdownForCat(cat)
+
+        // deduplicate
+        if (id == lastAlertId && alertState.value.active) return
+        lastAlertId = id
+
+        // filter by watched areas
+        val watchedAreas = buildWatchedSet(prefs.state.value)
+        val relevant = if (watchedAreas.isEmpty()) cities
+                       else cities.filter { city -> watchedAreas.any { city.contains(it, ignoreCase = true) } }
+
+        if (relevant.isEmpty()) return
+
+        val newState = AlertState(
+            active       = true,
+            cities       = relevant,
+            type         = type,
+            instructions = instr,
+            countdown    = countdown,
+            triggeredAt  = System.currentTimeMillis()
+        )
+        alertState.emit(newState)
+        showNotification(relevant, instr, countdown)
+        vibrate()
+    }
+
+    private fun buildWatchedSet(p: AppPrefs): Set<String> {
+        val s = p.watchedAreas.toMutableSet()
+        if (p.useGps && p.gpsCity != null) s.add(p.gpsCity)
+        return s
+    }
+
+    private fun countdownForCat(cat: Int) = when (cat) {
+        1, 2, 13 -> 90  // missiles / drones
+        3        -> 0   // infiltration
+        4        -> 0   // earthquake
+        6        -> 0   // tsunami
+        else     -> 60
+    }
+
+    private fun showNotification(cities: List<String>, instr: String, countdown: Int) {
+        val title = "🚨 צבע אדום – ${cities.take(2).joinToString(", ")}"
+        val text  = if (countdown > 0) "$instr • $countdown שנ'" else instr
+
+        val notif = NotificationCompat.Builder(ctx, MainActivity.ALERT_CHANNEL)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setColor(0xFFCC0000.toInt())
+            .setAutoCancel(true)
+            .build()
+
+        ctx.getSystemService(NotificationManager::class.java).notify(1, notif)
+    }
+
+    private fun vibrate() {
+        val pattern = longArrayOf(0, 600, 150, 600, 150, 600, 150, 600)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vm = ctx.getSystemService(VibratorManager::class.java)
+            vm.defaultVibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        } else {
+            @Suppress("DEPRECATION")
+            (ctx.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator)
+                .vibrate(pattern, -1)
+        }
+    }
+
+    companion object {
+        const val ALERT_URL =
+            "https://www.oref.org.il/WarningMessages/alert/alerts.json"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PREFERENCES  (SharedPreferences wrapper with Flow)
+// ─────────────────────────────────────────────────────────────────────────────
+
+class AppPreferences(ctx: Context) {
+
+    private val sp = ctx.getSharedPreferences("redalert_watch", Context.MODE_PRIVATE)
+
+    private val _state = MutableStateFlow(load())
+    val state: StateFlow<AppPrefs> = _state
+
+    fun save(p: AppPrefs) {
+        sp.edit()
+            .putStringSet("areas",   p.watchedAreas)
+            .putBoolean("useGps",    p.useGps)
+            .putString("gpsCity",    p.gpsCity)
+            .apply()
+        _state.value = p
+    }
+
+    private fun load() = AppPrefs(
+        watchedAreas = sp.getStringSet("areas", emptySet()) ?: emptySet(),
+        useGps       = sp.getBoolean("useGps", false),
+        gpsCity      = sp.getString("gpsCity", null)
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UI – STANDBY SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun StandbyScreen(alert: AlertState, prefs: AppPrefs, onSettings: () -> Unit) {
+    val areaCount = prefs.watchedAreas.size + (if (prefs.useGps && prefs.gpsCity != null) 1 else 0)
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0C0C0C))
+            .clickable { onSettings() },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(12.dp)
+        ) {
+            // pulse dot
+            val inf = rememberInfiniteTransition(label = "pulse")
+            val scale by inf.animateFloat(
+                1f, 1.4f,
+                infiniteRepeatable(tween(900), RepeatMode.Reverse),
+                label = "s"
+            )
+            Box(
+                Modifier
+                    .size(10.dp)
+                    .scale(scale)
+                    .clip(CircleShape)
+                    .background(Color(0xFF00E676))
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "פיקוד העורף",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (areaCount == 0) "לחץ להגדרת אזורים"
+                else "$areaCount אזורים פעילים",
+                color = Color.White.copy(alpha = 0.45f),
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center
+            )
+            if (prefs.useGps && prefs.gpsCity != null) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "📍 ${prefs.gpsCity}",
+                    color = Color(0xFF00E676).copy(alpha = 0.7f),
+                    fontSize = 10.sp
+                )
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UI – ALERT SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+fun AlertScreen(alert: AlertState, onDismiss: () -> Unit) {
+    var secsLeft by remember { mutableIntStateOf(alert.countdown) }
+
+    LaunchedEffect(alert.triggeredAt) {
+        secsLeft = alert.countdown
+        while (secsLeft > 0) { delay(1_000); secsLeft-- }
+    }
+
+    val inf = rememberInfiniteTransition(label = "bg")
+    val bgAlpha by inf.animateFloat(
+        0.88f, 1f,
+        infiniteRepeatable(tween(500, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "a"
+    )
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color(0xFFBB0000).copy(alpha = bgAlpha))
+            .clickable { onDismiss() },
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier.padding(10.dp)
+        ) {
+            // Siren icon with bounce
+            val sScale by inf.animateFloat(
+                1f, 1.15f,
+                infiniteRepeatable(tween(450), RepeatMode.Reverse), label = "icon"
+            )
+            Text("🚨", fontSize = 28.sp, modifier = Modifier.scale(sScale))
+            Spacer(Modifier.height(3.dp))
+
+            Text("צבע אדום",
+                color = Color.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Black)
+
+            Spacer(Modifier.height(2.dp))
+
+            // City list (max 2 lines)
+            val cityText = alert.cities.take(3).joinToString(" · ")
+            Text(cityText,
+                color = Color.White.copy(alpha = 0.9f),
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 8.dp))
+
+            Spacer(Modifier.height(6.dp))
+
+            // Countdown ring
+            if (alert.countdown > 0) {
+                CountdownRing(secsLeft, alert.countdown)
+                Spacer(Modifier.height(6.dp))
+            }
+
+            Text(alert.instructions,
+                color = Color.White,
+                fontSize = 10.sp,
+                textAlign = TextAlign.Center,
+                maxLines = 2,
+                lineHeight = 14.sp,
+                modifier = Modifier.padding(horizontal = 6.dp))
+
+            Spacer(Modifier.height(6.dp))
+            Text("לחץ לסגור",
+                color = Color.White.copy(alpha = 0.35f),
+                fontSize = 9.sp)
+        }
+    }
+}
+
+@Composable
+fun CountdownRing(secsLeft: Int, total: Int) {
+    val progress = if (total > 0) secsLeft.toFloat() / total else 0f
+    Box(contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(
+            progress          = progress,
+            modifier          = Modifier.size(50.dp),
+            strokeWidth       = 3.dp,
+            indicatorColor    = Color.White,
+            trackColor        = Color.White.copy(alpha = 0.15f)
+        )
+        Text(secsLeft.toString(),
+            color      = Color.White,
+            fontSize   = 18.sp,
+            fontWeight = FontWeight.Bold)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UI – SETTINGS SCREEN
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Common Israeli cities/areas for quick selection
+val PRESET_AREAS = listOf(
+    "תל אביב", "ירושלים", "חיפה", "באר שבע", "ראשון לציון",
+    "פתח תקווה", "אשדוד", "אשקלון", "נתניה", "רמת גן",
+    "גבעתיים", "בני ברק", "חולון", "בת ים", "הרצליה",
+    "כפר סבא", "רעננה", "מודיעין", "רחובות", "נס ציונה",
+    "עכו", "נהריה", "טבריה", "צפת", "אילת",
+    "קריית שמונה", "שדרות", "נתיבות", "אופקים", "דימונה"
+)
+
+@Composable
+fun SettingsScreen(
+    prefs: AppPrefs,
+    onRequestGps: () -> Unit,
+    onSave: (AppPrefs) -> Unit
+) {
+    var selected by remember { mutableStateOf(prefs.watchedAreas.toMutableSet()) }
+    var useGps   by remember { mutableStateOf(prefs.useGps) }
+
+    ScalingLazyColumn(
+        modifier             = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0C0C0C)),
+        contentPadding       = PaddingValues(top = 28.dp, bottom = 24.dp, start = 8.dp, end = 8.dp),
+        verticalArrangement  = Arrangement.spacedBy(4.dp)
+    ) {
+        item {
+            Text("הגדרות אזורים",
+                color      = Color.White,
+                fontSize   = 13.sp,
+                fontWeight = FontWeight.Bold,
+                modifier   = Modifier.fillMaxWidth(),
+                textAlign  = TextAlign.Center)
+        }
+
+        // GPS row
+        item {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(
+                        if (useGps) Color(0xFF00E676).copy(alpha = 0.15f)
+                        else Color.White.copy(alpha = 0.06f)
+                    )
+                    .clickable {
+                        useGps = !useGps
+                        if (useGps) onRequestGps()
+                    }
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalAlignment   = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column {
+                    Text("📍 GPS אוטומטי",
+                        color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    if (prefs.gpsCity != null) {
+                        Text(prefs.gpsCity,
+                            color = Color(0xFF00E676).copy(alpha = 0.8f), fontSize = 10.sp)
+                    }
+                }
+                Box(
+                    Modifier
+                        .size(16.dp)
+                        .clip(CircleShape)
+                        .background(if (useGps) Color(0xFF00E676) else Color.White.copy(alpha = 0.2f))
+                )
+            }
+        }
+
+        item {
+            Text("בחר אזורים:",
+                color    = Color.White.copy(alpha = 0.45f),
+                fontSize = 10.sp,
+                modifier = Modifier.padding(start = 4.dp, top = 4.dp))
+        }
+
+        // Area chips
+        items(PRESET_AREAS.chunked(2)) { row ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                row.forEach { area ->
+                    val active = area in selected
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(
+                                if (active) Color(0xFFCC0000).copy(alpha = 0.85f)
+                                else Color.White.copy(alpha = 0.07f)
+                            )
+                            .clickable {
+                                selected = selected.toMutableSet().also {
+                                    if (active) it.remove(area) else it.add(area)
+                                }
+                            }
+                            .padding(vertical = 6.dp, horizontal = 4.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(area,
+                            color     = if (active) Color.White else Color.White.copy(alpha = 0.6f),
+                            fontSize  = 10.sp,
+                            textAlign = TextAlign.Center,
+                            maxLines  = 1,
+                            overflow  = TextOverflow.Ellipsis)
+                    }
+                }
+                // pad if odd
+                if (row.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
+
+        // Save button
+        item {
+            Spacer(Modifier.height(4.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Color(0xFFCC0000))
+                    .clickable { onSave(AppPrefs(selected, useGps, prefs.gpsCity)) }
+                    .padding(vertical = 10.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("שמור", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
